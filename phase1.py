@@ -128,37 +128,55 @@ def download_pdf(url: str, dest: str) -> str:
         return "skipped"
 
     headers = {"User-Agent": USER_AGENT}
-    try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
-        resp.raise_for_status()
 
-        content_type = resp.headers.get("Content-Type", "").lower()
-        # Some servers return application/octet-stream for PDFs — allow that too.
-        if "pdf" not in content_type and "octet-stream" not in content_type:
-            # Check if the body starts with the PDF magic bytes
-            first_bytes = next(resp.iter_content(chunk_size=8), b"")
-            if not first_bytes.startswith(b"%PDF"):
-                logger.warning(
-                    "  URL does not point to a PDF (Content-Type: %s): %s",
-                    content_type,
-                    url,
-                )
-                return "not_pdf"
-            # It *is* a PDF despite the header; write the bytes we already read.
+    for verify_ssl in (True, False):
+        try:
+            if not verify_ssl:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                logger.info("  Retrying without SSL verification …")
+
+            resp = requests.get(
+                url, headers=headers, timeout=REQUEST_TIMEOUT,
+                stream=True, verify=verify_ssl,
+            )
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("Content-Type", "").lower()
+            # Some servers return application/octet-stream for PDFs — allow that too.
+            if "pdf" not in content_type and "octet-stream" not in content_type:
+                # Check if the body starts with the PDF magic bytes
+                first_bytes = next(resp.iter_content(chunk_size=8), b"")
+                if not first_bytes.startswith(b"%PDF"):
+                    logger.warning(
+                        "  URL does not point to a PDF (Content-Type: %s): %s",
+                        content_type,
+                        url,
+                    )
+                    return "not_pdf"
+                # It *is* a PDF despite the header; write the bytes we already read.
+                with open(dest, "wb") as f:
+                    f.write(first_bytes)
+                    for chunk in resp.iter_content(chunk_size=1 << 16):
+                        f.write(chunk)
+                return "success"
+
             with open(dest, "wb") as f:
-                f.write(first_bytes)
                 for chunk in resp.iter_content(chunk_size=1 << 16):
                     f.write(chunk)
             return "success"
 
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1 << 16):
-                f.write(chunk)
-        return "success"
+        except requests.exceptions.SSLError:
+            if verify_ssl:
+                # Will retry with verify=False on next loop iteration
+                continue
+            logger.error("  SSL error persists for %s", url)
+            return "error:ssl_failure"
+        except requests.RequestException as exc:
+            logger.error("  Download failed for %s: %s", url, exc)
+            return f"error:{exc}"
 
-    except requests.RequestException as exc:
-        logger.error("  Download failed for %s: %s", url, exc)
-        return f"error:{exc}"
+    return "error:unknown"
 
 
 def download_all(df: pd.DataFrame) -> dict[int, str]:
